@@ -1,253 +1,142 @@
 const express = require("express");
 const cors = require("cors");
-const { Pool } = require("pg");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static("public")); // фронтенд лежит в папке /public
+app.use(express.static("public"));
 
-// ─── PostgreSQL ────────────────────────────────────────────────────────────────
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-});
+// ─── JSON-файл для хранения данных ───────────────────────────────────────────
+const DATA_FILE = path.join(__dirname, "data.json");
 
-// ─── Инициализация таблиц при старте ──────────────────────────────────────────
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS inventory (
-      id        SERIAL PRIMARY KEY,
-      name      TEXT UNIQUE NOT NULL,
-      qty       INTEGER NOT NULL DEFAULT 0,
-      price     NUMERIC(10,2) NOT NULL DEFAULT 0
-    );
-  `);
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS cash_register (
-      id      INTEGER PRIMARY KEY DEFAULT 1,
-      balance NUMERIC(10,2) NOT NULL DEFAULT 0,
-      CHECK (id = 1)
-    );
-  `);
-
-  // Гарантируем, что строка кассы всегда существует
-  await pool.query(`
-    INSERT INTO cash_register (id, balance)
-    VALUES (1, 0)
-    ON CONFLICT (id) DO NOTHING;
-  `);
-
-  console.log("✅ Database initialised");
+function loadData() {
+  if (!fs.existsSync(DATA_FILE)) {
+    return { inventory: {}, cashRegister: 0 };
+  }
+  try {
+    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+  } catch {
+    return { inventory: {}, cashRegister: 0 };
+  }
 }
+
+function saveData() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify({ inventory, cashRegister }, null, 2));
+}
+
+// Загружаем данные при старте
+const stored = loadData();
+let inventory = stored.inventory;
+let cashRegister = stored.cashRegister;
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  INVENTORY ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// GET  /api/inventory  — список всех товаров
-app.get("/api/inventory", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "SELECT * FROM inventory ORDER BY name ASC"
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "DB error" });
-  }
+// GET /api/inventory — список всех товаров
+app.get("/api/inventory", (req, res) => {
+  const result = Object.entries(inventory).map(([name, data]) => ({
+    name,
+    qty: data.qty,
+    price: data.price,
+  }));
+  res.json(result);
 });
 
-// POST /api/inventory  — добавить товар (или увеличить кол-во если уже есть)
-app.post("/api/inventory", async (req, res) => {
+// POST /api/inventory — добавить товар
+app.post("/api/inventory", (req, res) => {
   const { name, qty } = req.body;
-
   if (!name || !qty || qty <= 0) {
     return res.status(400).json({ error: "Invalid name or qty" });
   }
 
-  try {
-    const { rows } = await pool.query(
-      `INSERT INTO inventory (name, qty, price)
-       VALUES ($1, $2, 0)
-       ON CONFLICT (name)
-       DO UPDATE SET qty = inventory.qty + $2
-       RETURNING *`,
-      [name.trim(), qty]
-    );
-    res.json(rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "DB error" });
+  if (!inventory[name]) {
+    inventory[name] = { qty: 0, price: 0 };
   }
+  inventory[name].qty += qty;
+  saveData();
+
+  res.json({ name, ...inventory[name] });
 });
 
-// PATCH /api/inventory/:name/qty  — изменить кол-во на delta (+/-)
-// Автоматически обновляет кассу: продажа (delta < 0) → касса растёт
-app.patch("/api/inventory/:name/qty", async (req, res) => {
+// PATCH /api/inventory/:name/qty — изменить количество на delta (+/-)
+app.patch("/api/inventory/:name/qty", (req, res) => {
   const name = decodeURIComponent(req.params.name);
-  const { delta } = req.body; // число, может быть отрицательным
+  const { delta } = req.body;
 
-  if (delta === undefined || isNaN(delta)) {
-    return res.status(400).json({ error: "Invalid delta" });
-  }
+  if (!inventory[name]) return res.status(404).json({ error: "Not found" });
+  if (delta === undefined || isNaN(delta)) return res.status(400).json({ error: "Invalid delta" });
 
-  try {
-    // Получаем текущую цену товара
-    const { rows: itemRows } = await pool.query(
-      "SELECT price FROM inventory WHERE name = $1",
-      [name]
-    );
-    if (!itemRows.length) return res.status(404).json({ error: "Not found" });
+  inventory[name].qty = Math.max(0, inventory[name].qty + delta);
 
-    const price = parseFloat(itemRows[0].price);
+  // Продажа (delta < 0) увеличивает кассу
+  cashRegister -= delta * inventory[name].price;
+  saveData();
 
-    // Обновляем количество (не ниже 0)
-    const { rows } = await pool.query(
-      `UPDATE inventory
-       SET qty = GREATEST(qty + $1, 0)
-       WHERE name = $2
-       RETURNING *`,
-      [delta, name]
-    );
-
-    // Обновляем кассу: продажа (−delta) увеличивает баланс
-    const cashDelta = -(delta * price);
-    await pool.query(
-      "UPDATE cash_register SET balance = balance + $1 WHERE id = 1",
-      [cashDelta]
-    );
-
-    res.json(rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "DB error" });
-  }
+  res.json({ name, ...inventory[name] });
 });
 
-// PATCH /api/inventory/:name/price  — обновить цену товара
-app.patch("/api/inventory/:name/price", async (req, res) => {
+// PATCH /api/inventory/:name/price — обновить цену
+app.patch("/api/inventory/:name/price", (req, res) => {
   const name = decodeURIComponent(req.params.name);
   const { price } = req.body;
 
-  if (price === undefined || isNaN(price) || price < 0) {
-    return res.status(400).json({ error: "Invalid price" });
-  }
+  if (!inventory[name]) return res.status(404).json({ error: "Not found" });
+  if (price === undefined || isNaN(price) || price < 0) return res.status(400).json({ error: "Invalid price" });
 
-  try {
-    const { rows } = await pool.query(
-      "UPDATE inventory SET price = $1 WHERE name = $2 RETURNING *",
-      [price, name]
-    );
-    if (!rows.length) return res.status(404).json({ error: "Not found" });
-    res.json(rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "DB error" });
-  }
+  inventory[name].price = parseFloat(price);
+  saveData();
+  res.json({ name, ...inventory[name] });
 });
 
-// POST /api/inventory/:name/sell  — продать N единиц
-app.post("/api/inventory/:name/sell", async (req, res) => {
+// POST /api/inventory/:name/sell — продать N штук
+app.post("/api/inventory/:name/sell", (req, res) => {
   const name = decodeURIComponent(req.params.name);
   const { qty } = req.body;
 
-  if (!qty || qty <= 0) {
-    return res.status(400).json({ error: "Invalid qty" });
-  }
+  if (!inventory[name]) return res.status(404).json({ error: "Not found" });
+  if (!qty || qty <= 0) return res.status(400).json({ error: "Invalid qty" });
 
-  try {
-    const { rows: itemRows } = await pool.query(
-      "SELECT price, qty FROM inventory WHERE name = $1",
-      [name]
-    );
-    if (!itemRows.length) return res.status(404).json({ error: "Not found" });
+  const sold = Math.min(qty, inventory[name].qty);
+  inventory[name].qty -= sold;
 
-    const price = parseFloat(itemRows[0].price);
-    const sold = Math.min(qty, itemRows[0].qty); // нельзя продать больше чем есть
+  const earned = sold * inventory[name].price;
+  cashRegister += earned;
+  saveData();
 
-    const { rows } = await pool.query(
-      `UPDATE inventory
-       SET qty = qty - $1
-       WHERE name = $2
-       RETURNING *`,
-      [sold, name]
-    );
-
-    const earned = sold * price;
-    await pool.query(
-      "UPDATE cash_register SET balance = balance + $1 WHERE id = 1",
-      [earned]
-    );
-
-    res.json({ item: rows[0], earned });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "DB error" });
-  }
+  res.json({ name, ...inventory[name], earned });
 });
 
-// DELETE /api/inventory/:name  — удалить товар
-app.delete("/api/inventory/:name", async (req, res) => {
+// DELETE /api/inventory/:name — удалить товар
+app.delete("/api/inventory/:name", (req, res) => {
   const name = decodeURIComponent(req.params.name);
-
-  try {
-    await pool.query("DELETE FROM inventory WHERE name = $1", [name]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "DB error" });
-  }
+  delete inventory[name];
+  saveData();
+  res.json({ success: true });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  CASH REGISTER ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/cash  — получить баланс кассы
-app.get("/api/cash", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      "SELECT balance FROM cash_register WHERE id = 1"
-    );
-    res.json({ balance: rows[0].balance });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "DB error" });
-  }
+// GET /api/cash — получить баланс
+app.get("/api/cash", (req, res) => {
+  res.json({ balance: cashRegister });
 });
 
-// PUT /api/cash  — вручную установить баланс кассы
-app.put("/api/cash", async (req, res) => {
+// PUT /api/cash — вручную задать баланс
+app.put("/api/cash", (req, res) => {
   const { balance } = req.body;
-
   if (balance === undefined || isNaN(balance)) {
     return res.status(400).json({ error: "Invalid balance" });
   }
-
-  try {
-    const { rows } = await pool.query(
-      "UPDATE cash_register SET balance = $1 WHERE id = 1 RETURNING *",
-      [balance]
-    );
-    res.json(rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "DB error" });
-  }
+  cashRegister = parseFloat(balance);
+  saveData();
+  res.json({ balance: cashRegister });
 });
 
 // ─── Старт ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-
-initDB()
-  .then(() => {
-    app.listen(PORT, () =>
-      console.log(`🚀 Server running on port ${PORT}`)
-    );
-  })
-  .catch((err) => {
-    console.error("❌ Failed to init DB:", err);
-    process.exit(1);
-  });
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));

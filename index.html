@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ספרות קבוצת יפו</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f6f8;
+      margin: 0;
+      padding: 20px;
+    }
+    h1 { text-align: center; margin-bottom: 30px; }
+    .container {
+      max-width: 900px;
+      margin: auto;
+      background: #ffffff;
+      padding: 20px;
+      border-radius: 10px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    }
+    .form {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 15px;
+    }
+    input { flex: 1; padding: 10px; font-size: 16px; }
+    button {
+      padding: 6px 12px;
+      font-size: 15px;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      color: white;
+    }
+    .add-btn  { background: #007bff; }
+    .plus     { background: #28a745; }
+    .minus    { background: #dc3545; }
+    .sold-btn { background: #6f42c1; }
+    .trash    { cursor: pointer; color: red; font-size: 20px; }
+    .search   { margin-bottom: 20px; }
+    table     { width: 100%; border-collapse: collapse; }
+    th, td    { border-bottom: 1px solid #ddd; padding: 10px; text-align: center; vertical-align: middle; }
+    .qty-controls { display: flex; justify-content: center; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .price-input  { width: 80px; padding: 5px; font-size: 14px; text-align: center; }
+    .search-cash-row { display: flex; gap: 15px; margin-bottom: 20px; align-items: center; }
+    .search-box  { flex: 2; }
+    .cash-box    { flex: 1; display: flex; align-items: center; gap: 10px; }
+    .cash-label  { font-weight: bold; white-space: nowrap; }
+    .cash-input  { width: 100%; padding: 10px; font-size: 16px; text-align: center; border: 2px solid #28a745; border-radius: 5px; }
+    @media (max-width: 600px) {
+      .form, .search-cash-row { flex-direction: column; }
+      .search-box, .cash-box  { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+
+  <h1>ספרות קבוצת יפו</h1>
+
+  <div class="container">
+
+    <!-- הוספת מוצר -->
+    <div class="form">
+      <input type="text"   id="productName" placeholder="שם המוצר" />
+      <input type="number" id="productQty"  placeholder="כמות התחלתית" min="1" />
+      <button class="add-btn" onclick="addProduct()">הוסף</button>
+    </div>
+
+    <!-- חיפוש וקופה -->
+    <div class="search-cash-row">
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="חיפוש מוצר..." oninput="renderTable()" />
+      </div>
+      <div class="cash-box">
+        <span class="cash-label">קופה:</span>
+        <input type="number" id="cashInput" class="cash-input" placeholder="0" step="0.01" onchange="setCash(this.value)" />
+      </div>
+    </div>
+
+    <!-- טבלה -->
+    <table>
+      <thead>
+        <tr>
+          <th>שם המוצר</th>
+          <th>כמות</th>
+          <th>מחיר</th>
+          <th>פעולות</th>
+        </tr>
+      </thead>
+      <tbody id="inventoryTable"></tbody>
+    </table>
+
+  </div>
+
+  <script>
+    // ─── כתובת ה-API (כשמריצים לוקאלית – localhost, בדפלוי – אותו דומיין) ───
+    const API = "";   // ריק = אותו origin
+
+    let inventory = [];
+
+    // ── טעינה ראשונית ─────────────────────────────────────────────────────────
+    async function init() {
+      await loadInventory();
+      await loadCash();
+    }
+
+    async function loadInventory() {
+      const res = await fetch(`${API}/api/inventory`);
+      inventory  = await res.json();
+      renderTable();
+    }
+
+    async function loadCash() {
+      const res  = await fetch(`${API}/api/cash`);
+      const data = await res.json();
+      document.getElementById("cashInput").value = data.balance;
+    }
+
+    // ── הוספת מוצר ───────────────────────────────────────────────────────────
+    async function addProduct() {
+      const name = document.getElementById("productName").value.trim();
+      const qty  = parseInt(document.getElementById("productQty").value);
+      if (!name || qty <= 0) return;
+
+      await fetch(`${API}/api/inventory`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, qty }),
+      });
+
+      document.getElementById("productName").value = "";
+      document.getElementById("productQty").value  = "";
+      await loadInventory();
+    }
+
+    // ── שינוי כמות (+/−) ──────────────────────────────────────────────────────
+    async function changeQty(name, delta) {
+      await fetch(`${API}/api/inventory/${encodeURIComponent(name)}/qty`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ delta }),
+      });
+      await loadInventory();
+      await loadCash();
+    }
+
+    // ── עדכון מחיר ────────────────────────────────────────────────────────────
+    async function updatePrice(name, price) {
+      await fetch(`${API}/api/inventory/${encodeURIComponent(name)}/price`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ price: parseFloat(price) || 0 }),
+      });
+      await loadInventory();
+    }
+
+    // ── מכירה ─────────────────────────────────────────────────────────────────
+    async function sellProduct(name) {
+      const qty = parseInt(prompt("הכנס כמות שנמכרה:"));
+      if (isNaN(qty) || qty <= 0) return;
+
+      await fetch(`${API}/api/inventory/${encodeURIComponent(name)}/sell`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ qty }),
+      });
+      await loadInventory();
+      await loadCash();
+    }
+
+    // ── מחיקה ─────────────────────────────────────────────────────────────────
+    async function deleteProduct(name) {
+      if (!confirm("למחוק את המוצר?")) return;
+      await fetch(`${API}/api/inventory/${encodeURIComponent(name)}`, { method: "DELETE" });
+      await loadInventory();
+    }
+
+    // ── עדכון קופה ידני ───────────────────────────────────────────────────────
+    async function setCash(value) {
+      await fetch(`${API}/api/cash`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ balance: parseFloat(value) || 0 }),
+      });
+    }
+
+    // ── רינדור ─────────────────────────────────────────────────────────────────
+    function renderTable() {
+      const search = document.getElementById("searchInput").value.toLowerCase();
+      const tbody  = document.getElementById("inventoryTable");
+      tbody.innerHTML = "";
+
+      inventory
+        .filter(item => item.name.toLowerCase().includes(search))
+        .forEach(item => {
+          tbody.innerHTML += `
+            <tr>
+              <td>${item.name}</td>
+              <td>${item.qty}</td>
+              <td>
+                <input
+                  type="number"
+                  class="price-input"
+                  value="${item.price}"
+                  onchange="updatePrice('${item.name}', this.value)"
+                  placeholder="מחיר"
+                  step="0.01"
+                  min="0"
+                />
+              </td>
+              <td>
+                <div class="qty-controls">
+                  <button class="plus"     onclick="changeQty('${item.name}',  1)">+</button>
+                  <button class="minus"    onclick="changeQty('${item.name}', -1)">−</button>
+                  <button class="sold-btn" onclick="sellProduct('${item.name}')">נמכר</button>
+                  <span  class="trash"     onclick="deleteProduct('${item.name}')">🗑️</span>
+                </div>
+              </td>
+            </tr>`;
+        });
+    }
+
+    init();
+  </script>
+
+</body>
+</html>
